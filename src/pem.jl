@@ -1,25 +1,5 @@
-function mats(p)
-    p.A, p.B, p.K
-end
-function model_from_params(p, h, ny)
-    A, B, K = mats(p)
-    x0      = copy(p.x0)
-    sys     = StateSpaceNoise(A, B, K, h)
-    sysf    = SysFilter(sys, x0, similar(x0, ny))
-end
-
-function pem_costfun(p, y, u, h, metric::F) where {F} # To ensure specialization on metric
-    nu, ny = obslength(u), obslength(y)
-    model = model_from_params(p, h, ny)
-    return mean(metric(e) for e in prediction_errors(model, y, u))
-end
-function sem_costfun(p, y, u, h, metric::F) where {F} # To ensure specialization on metric
-    nu, ny = obslength(u), obslength(y)
-    model = model_from_params(p, h, ny)
-    return mean(metric(e) for e in simulation_errors(model, y, u))
-end
-
-
+ControlSystems.StateSpace(kf::KalmanFilter, h) = ss(kf.A,kf.B,kf.C,0,h)
+tosvec(y) = reinterpret(SVector{length(y[1]),Float64}, reduce(hcat,y))[:] |> copy
 """
     sys, x0, opt = pem(data; nx, kwargs...)
 
@@ -58,65 +38,56 @@ function pem(
     nx,
     solver              = BFGS(),
     focus               = :prediction,
-    metric              = sse,
-    regularizer         = p -> 0,
+    regularizer::F      = p -> 0,
     iterations          = 1000,
-    stabilize_predictor = true,
-    difficult           = false,
-    A                   = 0.0001randn(nx, nx),
-    B                   = 0.001randn(nx, obslength(input(d))),
-    # C                   = 0.001randn(obslength(output(d)), nx),
-    K                   = 0.001randn(nx, obslength(output(d))),
-    x0                  = 0.001randn(nx),
+    sys0                = nothing,
     kwargs...,
-)
+) where F
 
-    y, u = output(d), input(d)
+    y, u = tosvec(output(d)), tosvec(input(d))
     nu, ny = obslength(u), obslength(y)
-    if size(A,1) != size(A,2) # Old API
-        A = [A zeros(nx, nx-ny)] 
+    if sys0 === nothing
+        sys0 = n4sid(d, nx)
+    else
+        nstates(sys0) == nx || throw(ArgumentError("Initial system sys0 does not have `nx` states."))
     end
-    p = ComponentVector((; A, B, K, x0))
+    A,B,C = sys0.A, sys0.B, sys0.C
+    p0 = ComponentVector((; A, B, C, x0=sys0.x[:,1]))
     options = Options(; iterations = iterations, kwargs...)
-    cost_pred = p -> pem_costfun(p, y, u, d.Ts, metric) + regularizer(p)
-    if difficult
-        stabilizer = p -> 10000 * !stabfun(d.Ts, ny)(p)
-        options0 = Options(; iterations = iterations, kwargs...)
-        opt = optimize(
-            p -> cost_pred(p) + stabilizer(p),
-            1000p,
-            # ParticleSwarm(n_particles = 100length(p)),
-            NelderMead(),
-            options0,
-        )
-        p = minimizer(opt)
+    function getsys(p, rm=1)
+        T = eltype(p)
+        A = SMatrix{nx,nx,T,nx^2}(p.A)
+        Q = SMatrix{nx,nx,T,nx^2}(T.(sys0.Q + eps()*I))
+        R = SMatrix{ny,ny,T,ny*ny}(T.(sys0.R + eps()*I)) * rm
+        B = SMatrix{nx,nu,T,nx*nu}(p.B)
+        C = SMatrix{ny,nx,T,nx*ny}(p.C)
+        KalmanFilter(A,B,C, 0, Q, R, MvNormal(p.x0, Matrix(10Q)))
     end
-    opt = optimize(cost_pred, p, solver, options; autodiff = :forward)
+    cost_pred = function (p)
+        kf = getsys(p)
+        try
+            return -loglik(kf, u, y) + regularizer(p)
+        catch
+            return eltype(p)(Inf)
+        end
+    end
+
+    opt = optimize(cost_pred, p0, solver, options; autodiff = :forward)
     println(opt)
     if focus == :simulation
         @info "Focusing on simulation"
-        cost_sim = p -> sem_costfun(p, y, u, d.Ts, metric) + regularizer(p)
-        opt = optimize(
-            cost_sim,
-            minimizer(opt),
-            NewtonTrustRegion(),
-            Options(; iterations = iterations ÷ 2, kwargs...);
-            autodiff = :forward,
-        )
+        cost_sim = function (p)
+            kf = getsys(p, 10000000)
+            mean(LowLevelParticleFilters.simulate(kf,u) .- y) + regularizer(p)
+        end
+        opt = optimize(cost_sim, opt.minimizer, solver, options; autodiff = :forward)
         println(opt)
     end
-    model = model_from_params(minimizer(opt), d.Ts, ny)
-    if !isstable(model.sys)
-        @warn("Estimated system does not have a stable prediction filter (A-KC)")
-        if stabilize_predictor
-            @info("Stabilizing predictor")
-            # model = stabilize(model)
-            model = stabilize(model, solver, options, cost_pred)
-        end
-    end
-    isstable(ss(model.sys)) || @warn("Estimated system is not stable")
+    
+    model = getsys(opt.minimizer)
+    all(<=(1), abs.(eigvals(Matrix(model.A)))) || @warn("Estimated system is not stable")
 
-    model.sys, copy(model.state), opt
+    StateSpace(model, d.Ts), model, opt
 end
 
 function stabilize(model)
@@ -133,21 +104,4 @@ function stabilize(model)
     all(abs(p) <= 1 for p in eigvals(A - K * C)) || @warn("Failed to stabilize predictor")
     s.K .= K2
     model
-end
-
-function stabilize(model, solver, options, cfi)
-    s = model.sys
-    cost = function (p)
-        maximum(abs.(eigvals(s.A - p * s.K * s.C))) - 0.9999999
-    end
-    p = fzero(cost, 1e-9, 1 - 1e-9)
-    s.K .*= p
-    model
-end
-
-function stabfun(h, ny)
-    function (p)
-        model = model_from_params(p, h, ny)
-        isstable(model.sys)
-    end
 end

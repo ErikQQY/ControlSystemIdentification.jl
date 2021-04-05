@@ -4,6 +4,7 @@ using DSP,
     LinearAlgebra,
     Statistics,
     StatsBase,
+    StaticArrays,
     Random,
     ComponentArrays,
     Optim,
@@ -34,8 +35,7 @@ export iddata,
     apply_fun,
     resample,
     timevec
-export StateSpaceNoise,
-    pem, simulation_errors, prediction_errors, predict, simulate, noise_model
+export pem, predict, simulate, noise_model
 export n4sid, era, okid
 export getARXregressor,
     getARregressor,
@@ -165,11 +165,7 @@ predplot
     nothing
 end
 
-function ControlSystems.lsim(sys::StateSpaceNoise, u; x0 = zeros(sys.nx))
-    simulate(sys, input(u), x0)
-end
-
-ControlSystems.innovation_form(sys::Union{StateSpaceNoise,N4SIDStateSpace}) =
+ControlSystems.innovation_form(sys::N4SIDStateSpace) =
     ss(sys.A, sys.K, sys.C, Matrix(Eye(sys.ny)), sys.Ts) # innovation model
 
 end # module
